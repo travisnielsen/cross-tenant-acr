@@ -1,14 +1,69 @@
 param location string = resourceGroup().location
+param acrManagedIdentityName string = 'contosoacr'
 
+var natGatewayIpName = '${uniqueString(resourceGroup().id)}-natgw'
+var bastionIpName = '${uniqueString(resourceGroup().id)}-bastion'
+var natGatewayName = uniqueString(resourceGroup().id)
 var vnetName = uniqueString(resourceGroup().id)
 var bastionName = uniqueString(resourceGroup().id)
 var acrName = uniqueString(resourceGroup().id)
 var buildServerName = uniqueString(resourceGroup().id)
 var acrPrivateDnsZoneName = 'privatelink.azurecr.io'
+var keyVaultName = uniqueString(resourceGroup().id)
+
+///
+/// IDENTITY
+///
+
+resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2018-11-30' = {
+  name: acrManagedIdentityName
+  location: location
+}
 
 ///
 /// NETWORKING
 ///
+
+resource natGatewayIP 'Microsoft.Network/publicIPAddresses@2021-05-01' = {
+  name: natGatewayIpName
+  location: location
+  sku: {
+    name: 'Standard'
+  }
+  properties: {
+    publicIPAddressVersion: 'IPv4'
+    publicIPAllocationMethod: 'Static'
+    idleTimeoutInMinutes: 4
+  }
+}
+
+resource bastionIP 'Microsoft.Network/publicIPAddresses@2021-05-01' = {
+  name: bastionIpName
+  location: location
+  sku: {
+    name: 'Standard'
+  }
+  properties: {
+    publicIPAddressVersion: 'IPv4'
+    publicIPAllocationMethod: 'Static'
+  }
+}
+
+resource natgateway 'Microsoft.Network/natGateways@2021-05-01' = {
+  name: natGatewayName
+  location: location
+  sku: {
+    name: 'Standard'
+  }
+  properties: {
+    idleTimeoutInMinutes: 4
+    publicIpAddresses: [
+      {
+        id: natGatewayIP.id
+      }
+    ]
+  }
+}
 
 resource vnet 'Microsoft.Network/virtualNetworks@2020-06-01' = {
   name: vnetName
@@ -30,6 +85,9 @@ resource vnet 'Microsoft.Network/virtualNetworks@2020-06-01' = {
         name: 'buildservers'
         properties: {
           addressPrefix: '10.0.1.0/24' // 10.0.1.0 - 10.0.1.255
+          natGateway: {
+            id: natgateway.id
+          }
         }
       }
       {
@@ -38,19 +96,16 @@ resource vnet 'Microsoft.Network/virtualNetworks@2020-06-01' = {
           addressPrefix: '10.0.2.0/24' // 10.0.2.0 - 10.0.2.255
         }
       }
+      {
+        name: 'agents'
+        properties: {
+          addressPrefix: '10.0.3.0/24' // 10.0.3.0 - 10.0.3.255
+          natGateway: {
+            id: natgateway.id
+          }
+        }
+      }
     ]
-  }
-}
-
-resource bastionIP 'Microsoft.Network/publicIPAddresses@2020-06-01' = {
-  name: bastionName
-  location: location
-  properties: {
-    publicIPAddressVersion: 'IPv4'
-    publicIPAllocationMethod: 'Static'
-  }
-  sku: {
-    name: 'Standard'
   }
 }
 
@@ -111,6 +166,18 @@ resource acr 'Microsoft.ContainerRegistry/registries@2022-02-01-preview' = {
   }
 }
 
+resource acrAgents 'Microsoft.ContainerRegistry/registries/agentPools@2019-06-01-preview' = {
+  name:'${acrName}-agents'
+  location: location
+  parent: acr
+  properties: {
+    count: 1
+    os: 'Linux'
+    tier: 'S1'
+    virtualNetworkSubnetResourceId: vnet.properties.subnets[3].id
+  }
+}
+
 var subscriptionId = subscription().subscriptionId
 var privateEndpointName = '${acr.name}-endpoint'
 var subnetId = resourceId(subscriptionId, resourceGroup().name, 'Microsoft.Network/virtualNetworks/subnets', vnetName, 'services')
@@ -159,7 +226,7 @@ resource privateDnsZoneConfig 'Microsoft.Network/privateEndpoints/privateDnsZone
 
 
 ///
-/// BUILD SERVER
+/// PRIVATE BUILD SERVER
 ///
 
 @description('Username for the Virtual Machine.')
@@ -215,6 +282,9 @@ resource buildserver 'Microsoft.Compute/virtualMachines@2022-03-01' = {
       linuxConfiguration: null
     }
   }
+  identity: {
+    type: 'SystemAssigned'
+  }
 }
 
 resource nic 'Microsoft.Network/networkInterfaces@2021-05-01' = {
@@ -232,5 +302,103 @@ resource nic 'Microsoft.Network/networkInterfaces@2021-05-01' = {
         }
       }
     ]
+  }
+}
+
+
+///
+/// KEY VAULT
+///
+
+@description('Password for Fabrikan Service Principal')
+@secure()
+param fabrikamPassword string
+
+resource akv 'Microsoft.KeyVault/vaults@2021-11-01-preview' = {
+  name: keyVaultName
+  location: location
+  properties: {
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    createMode: 'default'
+    enableRbacAuthorization: true
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 7
+    tenantId: subscription().tenantId
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
+
+  }
+}
+
+resource secret 'Microsoft.KeyVault/vaults/secrets@2021-11-01-preview' = {
+  name: 'fabrikamaccount'
+  parent: akv
+  properties: {
+    value: fabrikamPassword
+    attributes: {
+      enabled: true
+    }
+  }
+}
+
+///
+/// RBAC
+///
+
+// See: https://docs.microsoft.com/en-us/azure/role-based-access-control/built-in-roles
+
+// Grant read Key Vault secrets to the user-assigned managed identity  
+
+var roleDefinitionIdAkvSecretsUser = '4633458b-17de-408a-b874-0445c86b69e6'
+
+resource akvSecretsAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
+  scope: akv
+  name: guid(resourceGroup().id, managedIdentity.id, roleDefinitionIdAkvSecretsUser)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionIdAkvSecretsUser)
+    principalId: managedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+
+// Grant ACR push / pull to build VM
+
+var roleDefinitionIdAcrPush = '8311e382-0749-4cb8-b61a-304f252e45ec'
+var roleDefinitionIdAcrPull = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var roleDefinitionIdRead = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+
+resource acrPushPushAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
+  scope: acr
+  name: guid(resourceGroup().id, managedIdentity.id, roleDefinitionIdAcrPush)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionIdAcrPush)
+    principalId: buildserver.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource acrPullAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
+  scope: acr
+  name: guid(resourceGroup().id, managedIdentity.id, roleDefinitionIdAcrPull)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionIdAcrPull)
+    principalId: buildserver.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource acrReadAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
+  scope: acr
+  name: guid(resourceGroup().id, managedIdentity.id, roleDefinitionIdRead)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionIdRead)
+    principalId: buildserver.identity.principalId
+    principalType: 'ServicePrincipal'
   }
 }
