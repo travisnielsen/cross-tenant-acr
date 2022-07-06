@@ -4,6 +4,7 @@ param acrManagedIdentityName string = 'contosoacr'
 var natGatewayIpName = '${uniqueString(resourceGroup().id)}-natgw'
 var bastionIpName = '${uniqueString(resourceGroup().id)}-bastion'
 var natGatewayName = uniqueString(resourceGroup().id)
+var nsgName = uniqueString(resourceGroup().id)
 var vnetName = uniqueString(resourceGroup().id)
 var bastionName = uniqueString(resourceGroup().id)
 var acrName = uniqueString(resourceGroup().id)
@@ -65,6 +66,112 @@ resource natgateway 'Microsoft.Network/natGateways@2021-05-01' = {
   }
 }
 
+resource nsgBastion 'Microsoft.Network/networkSecurityGroups@2020-06-01' = {
+  name: '${nsgName}-bastion'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'bastion-ingress'
+          properties: {
+            priority: 100
+            protocol: 'Tcp'
+            access: 'Allow'
+            direction: 'Inbound'
+            sourceAddressPrefix: 'Internet'
+            sourcePortRange: '*'
+            destinationAddressPrefix: '*'
+            destinationPortRange: '443'
+          }
+      }
+      {
+        name: 'bastion-gatewaymgr'
+        properties: {
+          priority: 120
+          protocol: 'Tcp'
+          access: 'Allow'
+          direction: 'Inbound'
+          sourceAddressPrefix: 'GatewayManager'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'bastion-loadbalancer'
+        properties: {
+          priority: 140
+          protocol: 'Tcp'
+          access: 'Allow'
+          direction: 'Inbound'
+          sourceAddressPrefix: 'AzureLoadBalancer'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'allow-ssh-rdp-vnet'
+        properties: {
+          priority: 100
+          protocol: '*'
+          access: 'Allow'
+          direction: 'Outbound'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'VirtualNetwork'
+          destinationPortRanges: [
+            '22'
+            '3389'
+          ]
+        }
+      }
+      {
+        name: 'allow-azure-dependencies'
+        properties: {
+          priority: 120
+          protocol: '*'
+          access: 'Allow'
+          direction: 'Outbound'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'AzureCloud'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'deny-internet'
+        properties: {
+          priority: 140
+          protocol: '*'
+          access: 'Deny'
+          direction: 'Outbound'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'Internet'
+          destinationPortRange: '*'
+        }
+      }
+    ]
+  }
+}
+
+resource nsgBuildServers 'Microsoft.Network/networkSecurityGroups@2020-06-01' = {
+  name: '${nsgName}-buildservers'
+  location: location
+}
+
+resource nsgServices 'Microsoft.Network/networkSecurityGroups@2020-06-01' = {
+  name: '${nsgName}-services'
+  location: location
+}
+
+resource nsgAcrAgents 'Microsoft.Network/networkSecurityGroups@2020-06-01' = {
+  name: '${nsgName}-acragents'
+  location: location
+}
+
+
 resource vnet 'Microsoft.Network/virtualNetworks@2020-06-01' = {
   name: vnetName
   location: location
@@ -79,12 +186,18 @@ resource vnet 'Microsoft.Network/virtualNetworks@2020-06-01' = {
         name: 'AzureBastionSubnet'
         properties: {
           addressPrefix: '10.0.0.0/24' // 10.0.0.0 - 10.0.0.255
+          networkSecurityGroup: {
+            id: nsgBastion.id
+          }
         }
       }
       {
         name: 'buildservers'
         properties: {
           addressPrefix: '10.0.1.0/24' // 10.0.1.0 - 10.0.1.255
+          networkSecurityGroup: {
+            id: nsgBuildServers.id
+          }
           natGateway: {
             id: natgateway.id
           }
@@ -94,12 +207,18 @@ resource vnet 'Microsoft.Network/virtualNetworks@2020-06-01' = {
         name: 'services'
         properties: {
           addressPrefix: '10.0.2.0/24' // 10.0.2.0 - 10.0.2.255
+          networkSecurityGroup: {
+            id: nsgServices.id
+          }
         }
       }
       {
         name: 'agents'
         properties: {
           addressPrefix: '10.0.3.0/24' // 10.0.3.0 - 10.0.3.255
+          networkSecurityGroup: {
+            id: nsgAcrAgents.id
+          }
           natGateway: {
             id: natgateway.id
           }
@@ -371,7 +490,8 @@ resource akvSecretsAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-pr
 
 var roleDefinitionIdAcrPush = '8311e382-0749-4cb8-b61a-304f252e45ec'
 var roleDefinitionIdAcrPull = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-var roleDefinitionIdRead = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+// var roleDefinitionIdRead = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+var roleDefinitionIdContribute = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 
 resource acrPushPushAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
   scope: acr
@@ -395,9 +515,9 @@ resource acrPullAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-previ
 
 resource acrReadAccess 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
   scope: acr
-  name: guid(resourceGroup().id, managedIdentity.id, roleDefinitionIdRead)
+  name: guid(resourceGroup().id, managedIdentity.id, roleDefinitionIdContribute)
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionIdRead)
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionIdContribute)
     principalId: buildserver.identity.principalId
     principalType: 'ServicePrincipal'
   }

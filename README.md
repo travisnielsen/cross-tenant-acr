@@ -13,7 +13,7 @@ Ensure you have updated versions of PowerShell and Azure CLI installed on your w
 ```powershell
 az group create --name contoso-acrdemo --location centralus
 az bicep build -f contosoinfra.bicep
-az deployment group create --resource-group contoso-acrdemo --name demo2 --template-file contosoinfra.json
+az deployment group create --resource-group contoso-acrdemo --name demo --template-file contosoinfra.json
 ```
 
 Use Bastion to connect to the virtual machine and install Docker:
